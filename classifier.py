@@ -3,11 +3,12 @@ import os
 import time
 import requests
 
-BASE_API_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 
 def _fallback_heuristico(mensagem: str) -> dict:
-    """Classificador determinístico usado se nenhuma API Key estiver configurada ou houver falha."""
+    """Classificador determinístico usado se nenhuma API Key estiver configurada ou todas falharem."""
     texto = mensagem.lower()
 
     if any(p in texto for p in ["boleto", "fatura", "cobrança", "cobranca", "pagamento", "estorno", "nota fiscal"]):
@@ -44,15 +45,43 @@ def _fallback_heuristico(mensagem: str) -> dict:
     }
 
 
-def _descobrir_modelo_ativo(chave: str) -> str:
-    """Consulta a API REST /models e seleciona o melhor modelo Gemini Flash disponível para a chave."""
-    resp = requests.get(f"{BASE_API_URL}/models", params={"key": chave}, timeout=10)
+def _montar_prompt(mensagem: str) -> str:
+    return f"""
+    Você é um sistema especialista de triagem de atendimento ao cliente.
+    Analise a mensagem abaixo e retorne APENAS um objeto JSON válido com as chaves exatas:
+    - "categoria": escolha estritamente entre "Financeiro", "Suporte Técnico", "Cancelamento" ou "Comercial"
+    - "urgencia": escolha estritamente entre "Alta", "Média" ou "Baixa"
+    - "sentimento": escolha estritamente entre "Negativo", "Neutro" ou "Positivo"
+    - "resumo": frase curta (máximo 15 palavras) descrevendo a dor real do cliente
+    - "resposta_sugerida": primeira resposta cordial, empática e objetiva em português (máximo 2 frases)
+
+    Mensagem do cliente:
+    \"\"\"{mensagem}\"\"\"
+    """
+
+
+def _normalizar_saida(parsed: dict) -> dict:
+    return {
+        "categoria": parsed.get("categoria", "Suporte Técnico"),
+        "urgencia": parsed.get("urgencia", "Média"),
+        "sentimento": parsed.get("sentimento", "Neutro"),
+        "resumo": parsed.get("resumo", "Solicitação registrada pelo cliente."),
+        "resposta_sugerida": parsed.get(
+            "resposta_sugerida",
+            "Olá! Recebemos sua mensagem e nossa equipe já está verificando.",
+        ),
+    }
+
+
+def _listar_modelos_gemini(chave: str) -> list[str]:
+    """Lista os modelos Gemini compatíveis com generateContent ordenados por maior chance de cota gratuita."""
+    resp = requests.get(f"{GEMINI_BASE_URL}/models", params={"key": chave}, timeout=10)
     resp.raise_for_status()
 
     modelos = resp.json().get("models", [])
     bloqueados = ("embedding", "imagen", "veo", "tts", "audio", "image", "robotics", "computer-use", "deep-research")
 
-    candidatos = []
+    ranqueados = []
     for m in modelos:
         nome = m.get("name", "")
         metodos = m.get("supportedGenerationMethods", [])
@@ -63,20 +92,61 @@ def _descobrir_modelo_ativo(chave: str) -> str:
             and "gemini" in nome_lower
             and not any(b in nome_lower for b in bloqueados)
         ):
-            is_flash = 1 if "flash" in nome_lower else 0
-            is_estavel = 0 if ("exp" in nome_lower or "preview" in nome_lower) else 1
-            is_padrao = 0 if "lite" in nome_lower else 1
-            candidatos.append((is_flash, is_estavel, is_padrao, nome))
+            # Prioriza modelos Flash e Flash-Lite estáveis (maiores limites no Free Tier)
+            score = 0
+            if "flash" in nome_lower:
+                score += 100
+            if "lite" in nome_lower:
+                score += 30
+            if "2.5" in nome_lower:
+                score += 20
+            elif "2.0" in nome_lower:
+                score += 10
+            if "exp" in nome_lower or "preview" in nome_lower:
+                score -= 25
 
-    if not candidatos:
-        raise ValueError("Nenhum modelo Gemini compatível com generateContent encontrado para esta API Key.")
+            ranqueados.append((score, nome))
 
-    candidatos.sort(reverse=True)
-    return candidatos[0][3]
+    ranqueados.sort(reverse=True)
+    return [nome for _, nome in ranqueados]
+
+
+def _chamar_groq(mensagem: str, chave: str, inicio: float) -> dict:
+    """Suporte opcional para chaves gratuitas da Groq (prefixo gsk_)."""
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": _montar_prompt(mensagem)}],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    response = requests.post(
+        GROQ_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {chave}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=15,
+    )
+    latencia_ms = round((time.perf_counter() - inicio) * 1000, 1)
+    response.raise_for_status()
+
+    texto_json = response.json()["choices"][0]["message"]["content"]
+    dados = _normalizar_saida(json.loads(texto_json))
+
+    return {
+        "dados": dados,
+        "telemetria": {
+            "modo": "API REST Groq llama-3.3-70b-versatile (Live)",
+            "status_http": response.status_code,
+            "latencia_ms": latencia_ms,
+            "endpoint": GROQ_ENDPOINT,
+        },
+    }
 
 
 def classificar_ticket(mensagem: str, api_key: str | None = None) -> dict:
-    """Envia a mensagem do cliente para a API REST de LLM e retorna JSON estruturado + telemetria HTTP."""
+    """Envia a mensagem para a API REST de LLM com failover automático entre modelos."""
     chave = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     inicio = time.perf_counter()
 
@@ -93,86 +163,74 @@ def classificar_ticket(mensagem: str, api_key: str | None = None) -> dict:
             },
         }
 
-    prompt = f"""
-    Você é um sistema especialista de triagem de atendimento ao cliente.
-    Analise a mensagem abaixo e retorne APENAS um objeto JSON válido com as chaves exatas:
-    - "categoria": escolha estritamente entre "Financeiro", "Suporte Técnico", "Cancelamento" ou "Comercial"
-    - "urgencia": escolha estritamente entre "Alta", "Média" ou "Baixa"
-    - "sentimento": escolha estritamente entre "Negativo", "Neutro" ou "Positivo"
-    - "resumo": frase curta (máximo 15 palavras) descrevendo a dor real do cliente
-    - "resposta_sugerida": primeira resposta cordial, empática e objetiva em português (máximo 2 frases)
-
-    Mensagem do cliente:
-    \"\"\"{mensagem}\"\"\"
-    """
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "responseMimeType": "application/json",
-        },
-    }
-
-    endpoint_atual = f"{BASE_API_URL}/models"
-
     try:
-        modelo_recurso = _descobrir_modelo_ativo(chave)
-        endpoint_atual = f"{BASE_API_URL}/{modelo_recurso}:generateContent"
+        # Se o usuário informar uma chave Groq (gsk_...), usa o endpoint OpenAI-compatible da Groq
+        if chave.startswith("gsk_"):
+            return _chamar_groq(mensagem, chave, inicio)
 
-        response = requests.post(
-            endpoint_atual,
-            params={"key": chave},
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=15,
-        )
-        latencia_ms = round((time.perf_counter() - inicio) * 1000, 1)
-        response.raise_for_status()
+        candidatos = _listar_modelos_gemini(chave)
+        if not candidatos:
+            raise ValueError("Nenhum modelo Gemini compatível encontrado para esta chave.")
 
-        body = response.json()
-        texto_json = body["candidates"][0]["content"]["parts"][0]["text"]
-        parsed = json.loads(texto_json)
-
-        resultado_validado = {
-            "categoria": parsed.get("categoria", "Suporte Técnico"),
-            "urgencia": parsed.get("urgencia", "Média"),
-            "sentimento": parsed.get("sentimento", "Neutro"),
-            "resumo": parsed.get("resumo", "Solicitação registrada pelo cliente."),
-            "resposta_sugerida": parsed.get(
-                "resposta_sugerida",
-                "Olá! Recebemos sua mensagem e nossa equipe já está verificando.",
-            ),
-        }
-
-        return {
-            "dados": resultado_validado,
-            "telemetria": {
-                "modo": f"API REST {modelo_recurso} (Live)",
-                "status_http": response.status_code,
-                "latencia_ms": latencia_ms,
-                "endpoint": endpoint_atual,
+        payload = {
+            "contents": [{"parts": [{"text": _montar_prompt(mensagem)}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
             },
         }
+
+        erros_tentativas = []
+        ultimo_status = 500
+        ultimo_endpoint = f"{GEMINI_BASE_URL}/models"
+
+        # Tenta até 6 modelos em cascata caso algum retorne 429 (cota zerada) ou 404
+        for modelo_recurso in candidatos[:6]:
+            ultimo_endpoint = f"{GEMINI_BASE_URL}/{modelo_recurso}:generateContent"
+            response = requests.post(
+                ultimo_endpoint,
+                params={"key": chave},
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=15,
+            )
+            ultimo_status = response.status_code
+
+            if response.status_code == 200:
+                latencia_ms = round((time.perf_counter() - inicio) * 1000, 1)
+                texto_json = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+                dados = _normalizar_saida(json.loads(texto_json))
+
+                return {
+                    "dados": dados,
+                    "telemetria": {
+                        "modo": f"API REST {modelo_recurso} (Live)",
+                        "status_http": 200,
+                        "latencia_ms": latencia_ms,
+                        "endpoint": ultimo_endpoint,
+                    },
+                }
+
+            if response.status_code in (404, 429):
+                erros_tentativas.append(f"{modelo_recurso}: HTTP {response.status_code}")
+                continue
+
+            response.raise_for_status()
+
+        raise RuntimeError(f"Todos os modelos testados atingiram limite de cota ({', '.join(erros_tentativas)})")
 
     except Exception as exc:
         latencia_ms = round((time.perf_counter() - inicio) * 1000, 1)
         resp_erro = getattr(exc, "response", None)
-        status_http = getattr(resp_erro, "status_code", 500)
-        detalhe = ""
-        if resp_erro is not None:
-            try:
-                detalhe = f" — {resp_erro.json().get('error', {}).get('message', '')[:120]}"
-            except Exception:
-                detalhe = f" — {resp_erro.text[:120]}"
+        status_http = getattr(resp_erro, "status_code", 429 if "429" in str(exc) else 500)
 
         resultado = _fallback_heuristico(mensagem)
         return {
             "dados": resultado,
             "telemetria": {
-                "modo": f"Fallback automático ({type(exc).__name__}{detalhe})",
+                "modo": f"Fallback automático ({str(exc)[:140]})",
                 "status_http": status_http,
                 "latencia_ms": latencia_ms,
-                "endpoint": endpoint_atual,
+                "endpoint": GEMINI_BASE_URL,
             },
         }
