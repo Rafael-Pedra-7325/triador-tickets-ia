@@ -1,3 +1,4 @@
+[![Live Demo](https://img.shields.io/badge/Live_Demo-Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://api-health-monitor-ia.streamlit.app/)
 # 🎯 Triador Inteligente de Tickets de Atendimento (IA + SQL)
 
 Sistema full-stack em Python para triagem automatizada de mensagens de clientes utilizando **Inteligência Artificial via API REST**, persistência relacional em **SQL (SQLite)** e painel operacional interativo em **Streamlit**.
